@@ -182,6 +182,33 @@ NEGATIVE_KEYWORDS = (
     "播客",
 )
 
+DISCUSSION_QUALITY_KEYWORDS = (
+    "原理",
+    "实现",
+    "架构",
+    "训练",
+    "推理",
+    "优化",
+    "benchmark",
+    "eval",
+    "latency",
+    "throughput",
+    "agent",
+    "rag",
+    "mcp",
+    "cuda",
+    "pytorch",
+    "tensorflow",
+    "python",
+    "golang",
+    "rust",
+    "代码",
+    "工程",
+    "部署",
+    "系统",
+    "模型",
+)
+
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1177,7 +1204,10 @@ def analyze_candidate(
     ai_post_count = 0
     tech_post_count = 0
     negative_post_count = 0
+    tech_discussion_comment_count = 0
+    high_quality_discussion_comment_count = 0
     evidence_posts: list[dict[str, Any]] = []
+    evidence_comments: list[dict[str, Any]] = []
     comment_user_ids: set[str] = set()
 
     for post in posts:
@@ -1203,6 +1233,23 @@ def analyze_candidate(
             comment_user_id = (comment.get("user") or {}).get("id", "")
             if comment_user_id:
                 comment_user_ids.add(comment_user_id)
+            comment_text = comment.get("content", "")
+            comment_ai_hits = keyword_hits(comment_text, AI_KEYWORDS)
+            comment_tech_hits = keyword_hits(comment_text, TECH_KEYWORDS)
+            discussion_hits = keyword_hits(comment_text, DISCUSSION_QUALITY_KEYWORDS)
+            if comment_ai_hits or comment_tech_hits:
+                tech_discussion_comment_count += 1
+            if discussion_hits and len(normalize_text(comment_text)) >= 24:
+                high_quality_discussion_comment_count += 1
+                if len(evidence_comments) < 3:
+                    evidence_comments.append(
+                        {
+                            "id": comment.get("id", ""),
+                            "snippet": truncate_text(comment_text, 120),
+                            "keywords": unique_preserve(comment_ai_hits + comment_tech_hits + discussion_hits)[:6],
+                            "user": (comment.get("user") or {}).get("screenName", ""),
+                        }
+                    )
 
     followed_by_seed_count = len(base.get("followedBySeedIds", []))
     follows_seed_count = len(base.get("followsSeedIds", []))
@@ -1211,6 +1258,10 @@ def analyze_candidate(
     unique_commenter_count = len(comment_user_ids) or base.get("uniqueCommenterCount", 0)
     seed_comment_overlap = len(comment_user_ids & seed_ids)
     followed_count = int(base.get("followedCount", 0) or 0)
+    seed_count = max(len(seed_ids), 1)
+    seed_touch_count = len(base.get("seedTouchIds", []))
+    seed_followed_rate = round(followed_by_seed_count / seed_count, 4)
+    seed_connected_rate = round(seed_touch_count / seed_count, 4)
 
     ai_signal_score = (
         len(profile_ai_hits) * 3
@@ -1220,11 +1271,28 @@ def analyze_candidate(
         - len(profile_negative_hits) * 2
         - negative_post_count
     )
+    developer_signal_score = (
+        len(profile_role_hits) * 3
+        + tech_post_count * 2
+        + ai_post_count
+        + tech_discussion_comment_count
+        + high_quality_discussion_comment_count * 2
+        - len(profile_negative_hits) * 2
+        - negative_post_count
+    )
     relation_score = (
         followed_by_seed_count * 3
         + follows_seed_count * 2
         + follows_ai_anchor_count * 4
         + seed_comment_overlap
+    )
+    known_tech_graph_score = round(
+        followed_by_seed_count * 5
+        + follows_seed_count * 2
+        + follows_ai_anchor_count * 4
+        + seed_touch_count * 1.5
+        + high_quality_discussion_comment_count * 0.5,
+        2,
     )
     confidence_score = round(
         ai_signal_score * 1.2
@@ -1243,12 +1311,18 @@ def analyze_candidate(
         reasons.append(f"最近动态里有 {ai_post_count} 条 AI 相关内容")
     if tech_post_count:
         reasons.append(f"最近动态里有 {tech_post_count} 条技术相关内容")
+    if tech_discussion_comment_count:
+        reasons.append(f"评论区里有 {tech_discussion_comment_count} 条技术讨论")
+    if high_quality_discussion_comment_count:
+        reasons.append(f"其中 {high_quality_discussion_comment_count} 条像高质量技术讨论")
     if followed_by_seed_count:
         reasons.append(f"被 {followed_by_seed_count} 个种子账号关注")
     if follows_seed_count:
         reasons.append(f"关注了 {follows_seed_count} 个种子账号")
     if follows_ai_anchor_count:
         reasons.append(f"关注了 {follows_ai_anchor_count} 个已确认 AI 技术人")
+    if seed_connected_rate >= 0.03:
+        reasons.append(f"与已知技术号连接率 {seed_connected_rate:.1%}")
     if seed_comment_overlap:
         reasons.append(f"有 {seed_comment_overlap} 个种子账号出现在其评论区")
     if unique_commenter_count:
@@ -1256,25 +1330,46 @@ def analyze_candidate(
     if profile_negative_hits:
         reasons.append(f"存在非技术信号: {', '.join(profile_negative_hits[:3])}")
 
+    confirmed_developer = (
+        developer_signal_score >= 12
+        and (
+            len(profile_role_hits) >= 1
+            or tech_post_count >= 2
+            or high_quality_discussion_comment_count >= 2
+        )
+    )
+    probable_developer = (
+        not confirmed_developer
+        and developer_signal_score >= 7
+        and (
+            tech_post_count >= 1
+            or tech_discussion_comment_count >= 2
+            or len(profile_role_hits) >= 1
+        )
+    )
     confirmed_ai = (
-        ai_signal_score >= 12 and (ai_post_count >= 2 or len(profile_role_hits) >= 1)
+        ai_signal_score >= 12
+        and confirmed_developer
+        and (ai_post_count >= 2 or len(profile_role_hits) >= 1)
     ) or (
-        ai_signal_score >= 9 and followed_by_seed_count >= 2 and tech_post_count >= 2
+        ai_signal_score >= 9 and confirmed_developer and followed_by_seed_count >= 2 and tech_post_count >= 2
     )
     probable_ai = (
         not confirmed_ai
+        and (confirmed_developer or probable_developer)
         and (
             (ai_signal_score >= 8 and tech_post_count >= 1)
             or (relation_score >= 10 and (ai_post_count >= 1 or follows_ai_anchor_count >= 2))
         )
     )
-    graph_candidate = (
-        not confirmed_ai
-        and not probable_ai
+    known_tech_graph_candidate = (
+        not confirmed_developer
+        and not probable_developer
         and (
             follows_ai_anchor_count >= 2
             or followed_by_seed_count >= 3
-            or len(base.get("seedTouchIds", [])) >= 4
+            or seed_touch_count >= 4
+            or seed_followed_rate >= 0.02
         )
     )
 
@@ -1286,21 +1381,30 @@ def analyze_candidate(
         "bio": base.get("bio", ""),
         "followingCount": base.get("followingCount", 0),
         "followedCount": followed_count,
-        "seedTouchCount": len(base.get("seedTouchIds", [])),
+        "seedTouchCount": seed_touch_count,
         "followedBySeedIds": base.get("followedBySeedIds", []),
         "followsSeedIds": base.get("followsSeedIds", []),
         "followsAiAnchorIds": follows_ai_anchor_ids,
         "aiSignalScore": ai_signal_score,
+        "developerSignalScore": developer_signal_score,
         "relationScore": relation_score,
+        "knownTechGraphScore": known_tech_graph_score,
         "confidenceScore": confidence_score,
         "aiPostCount": ai_post_count,
         "techPostCount": tech_post_count,
+        "techDiscussionCommentCount": tech_discussion_comment_count,
+        "highQualityDiscussionCommentCount": high_quality_discussion_comment_count,
+        "seedFollowedRate": seed_followed_rate,
+        "seedConnectedRate": seed_connected_rate,
         "uniqueCommenterCount": unique_commenter_count,
         "evidencePosts": evidence_posts,
+        "evidenceComments": evidence_comments,
         "reasons": reasons,
+        "confirmedDeveloper": confirmed_developer,
+        "probableDeveloper": probable_developer,
         "confirmedAiTech": confirmed_ai,
         "probableAiTech": probable_ai,
-        "graphCandidate": graph_candidate,
+        "knownTechGraphCandidate": known_tech_graph_candidate,
         "contentCaptured": bool(detail),
     }
 
@@ -1317,15 +1421,19 @@ def write_report(run_dir: Path, analysis: dict[str, Any]) -> Path:
     lines.append(f"- 已抓内容候选人: {summary['detailCapturedCount']}")
     lines.append(f"- 角色词过滤: {summary['roleKeywordFilteredCount']}")
     lines.append(f"- 低活跃过滤: {summary['lowActivityFilteredCount']}")
+    lines.append(f"- 确定是开发人员: {summary['confirmedDeveloperCount']}")
+    lines.append(f"- 高概率开发人员: {summary['probableDeveloperCount']}")
     lines.append(f"- 确定是 AI 技术的人: {summary['confirmedAiTechCount']}")
     lines.append(f"- 高概率 AI 技术人: {summary['probableAiTechCount']}")
-    lines.append(f"- 关系型候选人: {summary['graphCandidateCount']}")
+    lines.append(f"- 技术关系扩散候选人: {summary['knownTechGraphCandidateCount']}")
     lines.append("")
 
     sections = [
+        ("确定是开发人员", analysis["confirmedDevelopers"]),
+        ("高概率开发人员", analysis["probableDevelopers"]),
         ("确定是 AI 技术的人", analysis["confirmedAiTech"]),
         ("高概率 AI 技术人", analysis["probableAiTech"]),
-        ("关系型候选人", analysis["graphCandidates"]),
+        ("技术关系扩散候选人", analysis["knownTechGraphCandidates"]),
     ]
 
     for title, records in sections:
@@ -1345,6 +1453,9 @@ def write_report(run_dir: Path, analysis: dict[str, Any]) -> Path:
             if record["evidencePosts"]:
                 example = record["evidencePosts"][0]
                 lines.append(f"   - 代表动态: {example['snippet']}")
+            elif record["evidenceComments"]:
+                example = record["evidenceComments"][0]
+                lines.append(f"   - 代表讨论: {example['snippet']}")
         lines.append("")
 
     filtered_sections = [
@@ -1396,9 +1507,11 @@ def run_analysis(
     ]
     records.sort(key=lambda item: (-item["confidenceScore"], -item["relationScore"], item["screenName"]))
 
+    confirmed_developers = [item for item in records if item["confirmedDeveloper"]]
+    probable_developers = [item for item in records if item["probableDeveloper"]]
     confirmed = [item for item in records if item["confirmedAiTech"]]
     probable = [item for item in records if item["probableAiTech"]]
-    graph_candidates = [item for item in records if item["graphCandidate"]]
+    known_tech_graph_candidates = [item for item in records if item["knownTechGraphCandidate"]]
 
     if expand_top_tech:
         selected_anchor_ids = [item["id"] for item in confirmed[:expand_top_tech]]
@@ -1422,9 +1535,11 @@ def run_analysis(
                 if not candidate_index[candidate_id].get("isSeed") and not candidate_index[candidate_id].get("skipDeepCrawl")
             ]
             records.sort(key=lambda item: (-item["confidenceScore"], -item["relationScore"], item["screenName"]))
+            confirmed_developers = [item for item in records if item["confirmedDeveloper"]]
+            probable_developers = [item for item in records if item["probableDeveloper"]]
             confirmed = [item for item in records if item["confirmedAiTech"]]
             probable = [item for item in records if item["probableAiTech"]]
-            graph_candidates = [item for item in records if item["graphCandidate"]]
+            known_tech_graph_candidates = [item for item in records if item["knownTechGraphCandidate"]]
 
     analysis = {
         "summary": {
@@ -1434,14 +1549,18 @@ def run_analysis(
             "detailCapturedCount": len(candidate_details),
             "roleKeywordFilteredCount": len(filtered_users["roleKeywordFiltered"]),
             "lowActivityFilteredCount": len(filtered_users["lowActivityFiltered"]),
+            "confirmedDeveloperCount": len(confirmed_developers),
+            "probableDeveloperCount": len(probable_developers),
             "confirmedAiTechCount": len(confirmed),
             "probableAiTechCount": len(probable),
-            "graphCandidateCount": len(graph_candidates),
+            "knownTechGraphCandidateCount": len(known_tech_graph_candidates),
         },
         "filteredUsers": filtered_users,
+        "confirmedDevelopers": confirmed_developers,
+        "probableDevelopers": probable_developers,
         "confirmedAiTech": confirmed,
         "probableAiTech": probable,
-        "graphCandidates": graph_candidates,
+        "knownTechGraphCandidates": known_tech_graph_candidates,
         "allRanked": records,
     }
     save_json(raw_dir / "filtered_users.json", filtered_users)
@@ -1516,9 +1635,10 @@ def cmd_full(args: argparse.Namespace) -> None:
     log(
         (
             "full pipeline done: "
+            f"developer={analysis['summary']['confirmedDeveloperCount']} "
             f"confirmed={analysis['summary']['confirmedAiTechCount']} "
             f"probable={analysis['summary']['probableAiTechCount']} "
-            f"graph={analysis['summary']['graphCandidateCount']}"
+            f"graph={analysis['summary']['knownTechGraphCandidateCount']}"
         ),
         log_file,
     )
