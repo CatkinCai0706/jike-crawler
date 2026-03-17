@@ -24,6 +24,15 @@ import requests
 PROJECT_DIR = Path(__file__).resolve().parent
 TARGETS_FILE = PROJECT_DIR / "auto_targets.json"
 PROGRESS_FILE = PROJECT_DIR / "auto_progress.json"
+TOKEN_FILE = PROJECT_DIR / "token.txt"
+CITY_CACHE_FILE = PROJECT_DIR / "city_cache.json"
+
+# 过滤配置
+MAX_FOLLOWER_COUNT = 3000  # 被关注数超过此值的用户不处理
+TARGET_CITY = "北京"       # 只处理该城市的用户
+
+# 即刻 API
+API_BASE = "https://api.ruguoapp.com/1.0"
 
 # wxk 复核台配置
 SITE_URL = "http://101.43.187.45:8010"
@@ -116,6 +125,9 @@ def sync_targets_from_site() -> bool:
 
     new_count = 0
     for uid, user in all_users.items():
+        # 过滤被关注数过高的大号
+        if user.get("follower_count", 0) >= MAX_FOLLOWER_COUNT:
+            continue
         if uid not in existing:
             new_count += 1
         existing[uid] = user
@@ -135,6 +147,128 @@ def sync_targets_from_site() -> bool:
     pending = sum(1 for t in targets if t["user_id"] not in processed_ids)
 
     log(f"同步完成! 总计 {len(targets)} 人, 新增 {new_count} 人, 待处理 {pending} 人")
+    return True
+
+
+def load_city_cache() -> dict:
+    """加载城市缓存"""
+    if CITY_CACHE_FILE.exists():
+        with open(CITY_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_city_cache(cache: dict):
+    with open(CITY_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def get_jike_token() -> str:
+    """获取即刻 Token，优先用已有的"""
+    if TOKEN_FILE.exists():
+        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            try:
+                resp = requests.get(
+                    f"{API_BASE}/users/profile",
+                    headers={"x-jike-access-token": token},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    return token
+            except Exception:
+                pass
+    log("即刻 Token 不存在或已过期，需要登录获取")
+    log("请运行: python3 get_token.py")
+    return ""
+
+
+def filter_by_city() -> bool:
+    """通过即刻 API 批量查询用户城市，过滤非目标城市的用户"""
+    log(f"========== 城市过滤（只保留{TARGET_CITY}） ==========")
+
+    if not TARGETS_FILE.exists():
+        log("auto_targets.json 不存在，跳过城市过滤")
+        return False
+
+    token = get_jike_token()
+    if not token:
+        log("无法获取 Token，跳过城市过滤（本次不按城市过滤）")
+        return False
+
+    with open(TARGETS_FILE, "r", encoding="utf-8") as f:
+        targets = json.load(f)
+
+    city_cache = load_city_cache()
+
+    # 找出还没查过城市的用户
+    unchecked = [t for t in targets if t["user_id"] not in city_cache]
+    log(f"目标用户 {len(targets)} 人, 已有城市缓存 {len(city_cache)} 人, 待查询 {len(unchecked)} 人")
+
+    if unchecked:
+        headers = {
+            "x-jike-access-token": token,
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Referer": "https://web.okjike.com/",
+        }
+        checked = 0
+        failed = 0
+        for user in unchecked:
+            uid = user["user_id"]
+            try:
+                resp = requests.get(
+                    f"{API_BASE}/users/profile",
+                    headers=headers,
+                    params={"username": uid},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    profile = resp.json().get("user", {})
+                    city = profile.get("city", "")
+                    province = profile.get("province", "")
+                    city_cache[uid] = {"city": city, "province": province}
+                    checked += 1
+                elif resp.status_code == 401:
+                    log("Token 过期，停止查询")
+                    break
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+
+            # 每查 50 个保存一次缓存 + 休息
+            if checked % 50 == 0 and checked > 0:
+                save_city_cache(city_cache)
+                log(f"  已查询 {checked} 人...")
+                time.sleep(2)
+            else:
+                time.sleep(0.5)  # 避免请求太快
+
+        save_city_cache(city_cache)
+        log(f"城市查询完成: 成功 {checked} 人, 失败 {failed} 人")
+
+    # 过滤：只保留目标城市 + 还没查到城市的（不误删）
+    before = len(targets)
+    filtered = []
+    removed = 0
+    for t in targets:
+        uid = t["user_id"]
+        if uid in city_cache:
+            info = city_cache[uid]
+            city = info.get("city", "")
+            province = info.get("province", "")
+            if TARGET_CITY in city or TARGET_CITY in province:
+                filtered.append(t)
+            else:
+                removed += 1
+        else:
+            # 没查到城市的先保留
+            filtered.append(t)
+
+    with open(TARGETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(filtered, f, ensure_ascii=False, indent=2)
+
+    log(f"城市过滤完成: {before} -> {len(filtered)} 人 (移除 {removed} 人非{TARGET_CITY})")
     return True
 
 
@@ -254,6 +388,11 @@ def main():
     # 第 1 步：同步网站名单
     if not args.skip_sync:
         sync_targets_from_site()
+        print()
+
+    # 第 1.5 步：城市过滤
+    if not args.skip_sync:
+        filter_by_city()
         print()
 
     # 可选：跑 pipeline 爬新人
