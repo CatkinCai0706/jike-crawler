@@ -1,6 +1,6 @@
-# 即刻技术人挖掘 MVP
+# 即刻技术人挖掘 + 自动触达
 
-这个目录现在不是单纯的“抓一个人关注列表”的调试脚本了，而是一条完整的 MVP 流程：
+完整的 MVP 流程：从即刻上自动发现技术人员，然后通过手机自动关注、私信、评论。
 
 - 输入 20 个即刻种子账号链接
 - 批量抓取种子账号的关注列表、被关注列表
@@ -13,11 +13,19 @@
   - 技术关系扩散候选人
 - 对命中过滤规则的人打本地标签，下次再遇到直接跳过
 - 对已经处理过的人复用本地缓存，默认不重复爬
+- **自动通过手机 Appium 对目标用户执行关注、私信、评论**
 
 ## 目录说明
 
 - `jike_pipeline.py`
   - 主入口。负责批量采集、断点续跑、分析、出报告。
+  - 跑完后自动生成 `auto_targets.json` 供自动触达使用。
+- `jike_auto.py`
+  - 自动触达脚本。通过 Appium 控制手机，批量关注、私信、评论。
+- `auto_config.py`
+  - 自动触达的配置文件（Appium 连接、防封策略、私信模板、每日上限等）。
+- `convert_pipeline_results.py`
+  - 手动转换工具。可以按类别筛选 pipeline 结果生成目标列表。
 - `seeds.example.txt`
   - 种子账号文件示例。
 - `runs/<run_name>/`
@@ -40,7 +48,6 @@
 1. 安装依赖
 
 ```bash
-cd /Users/xiaokang/my_project/jike-crawler
 python3 -m pip install -r requirements.txt
 python3 -m playwright install chromium
 ```
@@ -127,8 +134,48 @@ python3 jike_pipeline.py analyze --run-dir runs/demo
 - 如果结果质量对了，再把 `relation-limit` 和 `candidate-limit` 放大
 - 结果不要直接当最终结论，先看 `report.md` 里的理由做一次人工复核
 
+## 自动触达（关注 + 私信 + 评论）
+
+pipeline 跑完后会自动生成 `auto_targets.json`，然后用 Appium 控制手机自动操作。
+
+### 前置条件
+
+- 安卓手机通过 USB 连接电脑，开启 USB 调试
+- 手机上已登录即刻 App
+- 电脑上安装并启动 Appium Server（默认 `http://127.0.0.1:4723`）
+- 修改 `auto_config.py` 中的 `DESIRED_CAPS` 为你的设备信息
+
+### 运行自动触达
+
+```bash
+# 处理所有目标用户（每日上限 30 人）
+python3 jike_auto.py
+
+# 测试模式：只处理前 3 个
+python3 jike_auto.py --test 3
+```
+
+### 手动筛选目标
+
+如果只想对特定类别的人操作：
+
+```bash
+# 只提取确定是 AI 技术的人
+python3 convert_pipeline_results.py --run-dir runs/demo --category confirmed_ai
+
+# 可选类别: all, confirmed_dev, probable_dev, confirmed_ai, probable_ai, graph
+```
+
+### 防封策略
+
+- 每次操作间隔 20-40 秒
+- 每处理 50 人休息 5-10 分钟
+- 每日上限 30 人（可在 `auto_config.py` 中调整）
+- 检测到验证码/风控弹窗会自动暂停，等待手动处理
+
 ## 风险
 
 - 即刻接口和风控可能变化，脚本依赖登录态和当前接口可用
-- 全量抓取的成本会迅速变高，建议优先用“种子一跳 + 关系扩展”
+- 全量抓取的成本会迅速变高，建议优先用”种子一跳 + 关系扩展”
 - 规则分析可以先出结果，但最终准确率还可以继续用大模型做二次判断
+- 自动触达操作过于频繁可能导致即刻账号被限制，建议保持每日上限不超过 50

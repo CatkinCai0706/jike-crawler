@@ -1643,6 +1643,36 @@ def cmd_full(args: argparse.Namespace) -> None:
         log_file,
     )
 
+    # 自动生成 auto_targets.json 供 jike_auto.py 使用
+    auto_targets = _build_auto_targets(analysis)
+    targets_path = PROJECT_DIR / "auto_targets.json"
+    save_json(targets_path, auto_targets)
+    log(f"auto_targets generated: {len(auto_targets)} users -> {targets_path}", log_file)
+
+
+def _build_auto_targets(analysis: dict) -> list[dict]:
+    """从分析结果中提取所有技术人员，生成 jike_auto.py 需要的用户列表"""
+    seen: set[str] = set()
+    all_records: list[dict] = []
+    for key in ("confirmedDevelopers", "probableDevelopers", "confirmedAiTech", "probableAiTech", "knownTechGraphCandidates"):
+        for record in analysis.get(key, []):
+            uid = record["id"]
+            if uid not in seen:
+                seen.add(uid)
+                all_records.append(record)
+    all_records.sort(key=lambda r: -r.get("confidenceScore", 0))
+    return [
+        {
+            "user_id": r["id"],
+            "username": r.get("screenName", ""),
+            "intro": r.get("briefIntro", ""),
+            "confidence_score": r.get("confidenceScore", 0),
+            "reasons": r.get("reasons", []),
+            "link": r.get("link", ""),
+        }
+        for r in all_records
+    ]
+
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir).expanduser().resolve()
