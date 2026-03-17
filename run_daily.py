@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """
-run_daily.py — 每日一键运行：爬人 + 自动关注/私信/评论
+run_daily.py — 每日一键运行：同步名单 + 自动关注/私信/评论
 
 用法:
-  python3 run_daily.py --seed-file seeds.txt
-  python3 run_daily.py --seed-file seeds.txt --skip-crawl    # 跳过爬人，只跑自动触达
-  python3 run_daily.py --seed-file seeds.txt --skip-auto     # 只爬人，不跑自动触达
-  python3 run_daily.py --seed-file seeds.txt --test 3        # 自动触达只处理前 3 个人
+  python3 run_daily.py                        # 同步网站名单 + 自动触达
+  python3 run_daily.py --skip-sync            # 跳过同步，用已有名单跑
+  python3 run_daily.py --skip-auto            # 只同步名单，不跑自动触达
+  python3 run_daily.py --test 3               # 自动触达只处理前 3 个人
+  python3 run_daily.py --pipeline seeds.txt   # 用种子账号跑 pipeline 爬新人
 """
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+import requests
+
 PROJECT_DIR = Path(__file__).resolve().parent
+TARGETS_FILE = PROJECT_DIR / "auto_targets.json"
+PROGRESS_FILE = PROJECT_DIR / "auto_progress.json"
+
+# wxk 复核台配置
+SITE_URL = "http://101.43.187.45:8010"
+SITE_USERNAME = "anke"
+SITE_PASSWORD = "anke2026"
+REVIEW_PAGES = [
+    "/review/developers",
+    "/review/entrepreneurs",
+    "/review/entrepreneur-developers",
+]
 
 
 def log(msg: str):
@@ -25,9 +41,106 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+def sync_targets_from_site() -> bool:
+    """从 wxk 复核台同步最新名单"""
+    log("========== 第 1 步：同步网站最新名单 ==========")
+
+    session = requests.Session()
+    try:
+        resp = session.post(f"{SITE_URL}/login", json={
+            "username": SITE_USERNAME,
+            "password": SITE_PASSWORD,
+        }, timeout=10)
+        if resp.status_code != 200:
+            log(f"登录失败: {resp.status_code}")
+            return False
+    except Exception as e:
+        log(f"连接网站失败: {e}")
+        return False
+
+    log("登录成功，开始拉取名单...")
+
+    all_users = {}
+    for path in REVIEW_PAGES:
+        label = path.split("/")[-1]
+        page = 1
+        page_total = 0
+        while True:
+            url = f"{SITE_URL}{path}?page={page}&page_size=50"
+            try:
+                resp = session.get(url, timeout=15)
+            except Exception as e:
+                log(f"  {label} page {page} 请求失败: {e}")
+                break
+            if resp.status_code != 200:
+                break
+
+            html = resp.text
+            rows = re.findall(
+                r'<a href="https://web\.okjike\.com/u/([^"]+)"[^>]*>([^<]+)</a>.*?col-count[^>]*>(\d+)',
+                html, re.DOTALL
+            )
+            if not rows:
+                break
+
+            for uid, name, count in rows:
+                if uid not in all_users:
+                    all_users[uid] = {
+                        "user_id": uid,
+                        "username": name,
+                        "follower_count": int(count),
+                        "source": [label],
+                    }
+                else:
+                    if label not in all_users[uid]["source"]:
+                        all_users[uid]["source"].append(label)
+
+            page_total += len(rows)
+
+            if f"page={page+1}" not in html:
+                break
+            page += 1
+
+        log(f"  {label}: {page_total} 人")
+
+    if not all_users:
+        log("未拉取到任何用户")
+        return False
+
+    # 加载已有的 targets，合并新用户
+    existing = {}
+    if TARGETS_FILE.exists():
+        with open(TARGETS_FILE, "r", encoding="utf-8") as f:
+            for item in json.load(f):
+                existing[item["user_id"]] = item
+
+    new_count = 0
+    for uid, user in all_users.items():
+        if uid not in existing:
+            new_count += 1
+        existing[uid] = user
+
+    targets = sorted(existing.values(), key=lambda x: -x.get("follower_count", 0))
+
+    with open(TARGETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(targets, f, ensure_ascii=False, indent=2)
+
+    # 统计待处理数
+    processed_ids = set()
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+        processed_ids = set(progress.get("processed", {}).keys())
+
+    pending = sum(1 for t in targets if t["user_id"] not in processed_ids)
+
+    log(f"同步完成! 总计 {len(targets)} 人, 新增 {new_count} 人, 待处理 {pending} 人")
+    return True
+
+
 def run_pipeline(seed_file: str, run_name: str) -> bool:
     """运行爬人 pipeline"""
-    log("========== 第 1 步：爬取技术人员 ==========")
+    log("========== 运行 Pipeline 爬取新人 ==========")
     cmd = [
         sys.executable, str(PROJECT_DIR / "jike_pipeline.py"),
         "full",
@@ -40,17 +153,6 @@ def run_pipeline(seed_file: str, run_name: str) -> bool:
         log(f"爬人失败（退出码 {result.returncode}）")
         return False
     log("爬人完成!")
-
-    # 检查是否生成了 auto_targets.json
-    targets_file = PROJECT_DIR / "auto_targets.json"
-    if targets_file.exists():
-        with open(targets_file, "r", encoding="utf-8") as f:
-            targets = json.load(f)
-        log(f"已生成 {len(targets)} 个目标用户")
-    else:
-        log("未生成 auto_targets.json，可能没有找到符合条件的技术人员")
-        return False
-
     return True
 
 
@@ -58,18 +160,29 @@ def run_auto(test_count: int | None = None) -> bool:
     """运行自动关注/私信/评论"""
     log("========== 第 2 步：自动关注/私信/评论 ==========")
 
-    targets_file = PROJECT_DIR / "auto_targets.json"
-    if not targets_file.exists():
+    if not TARGETS_FILE.exists():
         log("auto_targets.json 不存在，跳过自动触达")
         return False
 
-    with open(targets_file, "r", encoding="utf-8") as f:
+    with open(TARGETS_FILE, "r", encoding="utf-8") as f:
         targets = json.load(f)
     if not targets:
         log("目标用户列表为空，跳过")
         return False
 
-    log(f"目标用户: {len(targets)} 个")
+    # 统计待处理
+    processed_ids = set()
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+        processed_ids = set(progress.get("processed", {}).keys())
+
+    pending = sum(1 for t in targets if t["user_id"] not in processed_ids)
+    log(f"目标用户: {len(targets)} 个, 待处理: {pending} 个")
+
+    if pending == 0:
+        log("所有用户已处理完毕!")
+        return True
 
     cmd = [sys.executable, str(PROJECT_DIR / "jike_auto.py")]
     if test_count:
@@ -89,17 +202,14 @@ def print_summary():
     """打印今日汇总"""
     log("========== 今日汇总 ==========")
 
-    # 读取自动触达进度
-    progress_file = PROJECT_DIR / "auto_progress.json"
-    if progress_file.exists():
-        with open(progress_file, "r", encoding="utf-8") as f:
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
             progress = json.load(f)
         today = datetime.now().strftime("%Y-%m-%d")
         today_count = progress.get("daily_counts", {}).get(today, 0)
         processed = progress.get("processed", {})
         total = len(processed)
 
-        # 统计今日结果
         today_results = [
             v for v in processed.values()
             if v.get("time", "").startswith(today)
@@ -114,38 +224,42 @@ def print_summary():
     else:
         log("暂无自动触达记录")
 
-    # 读取目标列表
-    targets_file = PROJECT_DIR / "auto_targets.json"
-    if targets_file.exists():
-        with open(targets_file, "r", encoding="utf-8") as f:
+    if TARGETS_FILE.exists():
+        with open(TARGETS_FILE, "r", encoding="utf-8") as f:
             targets = json.load(f)
-        log(f"目标池剩余: {len(targets)} 人")
+        processed_ids = set()
+        if PROGRESS_FILE.exists():
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                progress = json.load(f)
+            processed_ids = set(progress.get("processed", {}).keys())
+        pending = sum(1 for t in targets if t["user_id"] not in processed_ids)
+        log(f"目标池总计: {len(targets)} 人, 剩余待处理: {pending} 人")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="每日一键运行：爬人 + 自动触达")
-    parser.add_argument("--seed-file", default="seeds.txt", help="种子账号文件（默认 seeds.txt）")
-    parser.add_argument("--run-name", default=None, help="本次运行名称（默认按日期生成）")
-    parser.add_argument("--skip-crawl", action="store_true", help="跳过爬人，只跑自动触达")
-    parser.add_argument("--skip-auto", action="store_true", help="只爬人，不跑自动触达")
+    parser = argparse.ArgumentParser(description="每日一键运行：同步名单 + 自动触达")
+    parser.add_argument("--skip-sync", action="store_true", help="跳过同步网站名单")
+    parser.add_argument("--skip-auto", action="store_true", help="只同步名单，不跑自动触达")
     parser.add_argument("--test", type=int, default=None, help="自动触达测试模式，只处理前 N 个人")
+    parser.add_argument("--pipeline", type=str, default=None, metavar="SEED_FILE",
+                        help="额外运行 pipeline 用种子账号爬新人（如 --pipeline seeds.txt）")
     args = parser.parse_args()
 
-    run_name = args.run_name or datetime.now().strftime("daily_%Y%m%d")
-
     log("====================================")
-    log("    即刻技术人挖掘 + 自动触达")
+    log("    即刻自动触达 — 每日任务")
     log("====================================")
     log(f"日期: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    log(f"种子文件: {args.seed_file}")
-    log(f"运行名称: {run_name}")
     print()
 
-    # 第 1 步：爬人
-    if not args.skip_crawl:
-        crawl_ok = run_pipeline(args.seed_file, run_name)
-        if not crawl_ok and not args.skip_auto:
-            log("爬人未成功，但仍尝试用已有的 auto_targets.json 跑自动触达")
+    # 第 1 步：同步网站名单
+    if not args.skip_sync:
+        sync_targets_from_site()
+        print()
+
+    # 可选：跑 pipeline 爬新人
+    if args.pipeline:
+        run_name = datetime.now().strftime("daily_%Y%m%d")
+        run_pipeline(args.pipeline, run_name)
         print()
 
     # 第 2 步：自动触达
